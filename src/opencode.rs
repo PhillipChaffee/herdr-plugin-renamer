@@ -6,19 +6,40 @@ use std::env;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// A real 745KB export completes in about a second, so the ceiling only
-/// bounds a hung export. It is short on purpose: the prompt poll calls this
-/// up to 20 times per cold phase, and a per-attempt ceiling of 5s keeps that
-/// poll inside the 120s claim TTL.
-const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
+/// bounds a hung export. It is short on purpose: see
+/// cold_phase_poll_budget_stays_under_claim_ttl in main.rs, which pins the
+/// worst-case poll budget well inside the 120s claim TTL.
+pub(crate) const EXPORT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Temp-file name prefix shared by the export writer and the sweeper.
+const EXPORT_FILE_PREFIX: &str = "herdr-renamer-export-";
 const DEFAULT_MODELS: &[&str] = &[
     "opencode/deepseek-v4-flash-free",
     "opencode/ling-3.0-flash-free",
     "opencode/mimo-v2.5-free",
 ];
+
+/// Build an `opencode` command with the shared hygiene: temp-dir cwd so
+/// opencode does not load project context, and the herdr pane env stripped
+/// so the herdr integration plugin stays inert.
+fn opencode_command(bin: &str) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .current_dir(env::temp_dir())
+        .env_remove("HERDR_PANE_ID")
+        .stdin(Stdio::null());
+    command
+}
+
+/// Kill a child that ran past its ceiling and reap it.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 /// Run `opencode run` non-interactively and return its raw stdout for the
 /// caller to parse. Runs from the temp dir so opencode does not load project
@@ -27,16 +48,13 @@ const DEFAULT_MODELS: &[&str] = &[
 pub fn generate(instruction: &str, model: &str) -> Option<String> {
     let bin = resolve_bin()?;
 
-    let mut command = Command::new(bin);
+    let mut command = opencode_command(&bin);
     command.arg("run");
     if model != "default" {
         command.args(["--model", model]);
     }
     let mut child = command
         .arg(instruction)
-        .current_dir(env::temp_dir())
-        .env_remove("HERDR_PANE_ID")
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -45,8 +63,7 @@ pub fn generate(instruction: &str, model: &str) -> Option<String> {
     let status = match wait_with_timeout(&mut child, TIMEOUT) {
         Some(status) => status,
         None => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             return None;
         }
     };
@@ -69,10 +86,14 @@ pub fn generate(instruction: &str, model: &str) -> Option<String> {
 /// instead of a pipe for two reasons: exports can exceed the OS pipe buffer,
 /// and piped export output gets truncated by opencode on large sessions.
 pub(crate) fn export_session(session_id: &str) -> Option<String> {
-    sweep_stale_exports();
+    // Housekeeping runs once per process: each cold phase is its own process,
+    // so repeating the temp-dir scan on every poll attempt would only add I/O.
+    static SWEEP: Once = Once::new();
+    SWEEP.call_once(sweep_stale_exports);
     let bin = resolve_bin()?;
     let temp = env::temp_dir().join(format!(
-        "herdr-renamer-export-{}-{}",
+        "{}{}-{}",
+        EXPORT_FILE_PREFIX,
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -87,13 +108,10 @@ pub(crate) fn export_session(session_id: &str) -> Option<String> {
         .open(&temp)
         .ok()?;
 
-    let mut command = Command::new(bin);
+    let mut command = opencode_command(&bin);
     command
         .arg("export")
         .arg(session_id)
-        .current_dir(env::temp_dir())
-        .env_remove("HERDR_PANE_ID")
-        .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(Stdio::null());
 
@@ -107,8 +125,7 @@ pub(crate) fn export_session(session_id: &str) -> Option<String> {
     let status = match wait_with_timeout(&mut child, EXPORT_TIMEOUT) {
         Some(status) => status,
         None => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             let _ = std::fs::remove_file(&temp);
             return None;
         }
@@ -123,15 +140,15 @@ pub(crate) fn export_session(session_id: &str) -> Option<String> {
 }
 
 /// Best-effort cleanup of export temp files left behind when a detached cold
-/// phase was killed between file creation and removal. Files older than a day
-/// are removed; any error is ignored.
+/// phase was killed between file creation and removal. Runs once per process.
+/// Files older than a day are removed; any error is ignored.
 fn sweep_stale_exports() {
     let Ok(entries) = std::fs::read_dir(env::temp_dir()) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("herdr-renamer-export-") {
+        if !name.to_string_lossy().starts_with(EXPORT_FILE_PREFIX) {
             continue;
         }
         let Ok(meta) = entry.metadata() else {

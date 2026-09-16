@@ -1,6 +1,7 @@
 //! Resolving an agent transcript from a native session id and extracting the
 //! first genuine user prompt. Supports Claude Code, Codex, Pi, Grok, and
-//! opencode, which use different on-disk formats.
+//! opencode, with per-agent storage: on-disk transcript files for most, and
+//! `opencode export` for opencode 1.18+.
 
 use std::env;
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 /// Some integrations (pi) report the transcript's absolute path as the session
 /// value, so an existing-file path short-circuits the per-agent glob. opencode
 /// reads through the legacy file layout first and falls through to
-/// `opencode export` when the files are absent.
+/// `opencode export` when the legacy layout does not resolve.
 pub fn read_first_prompt(agent: &str, session_id: &str) -> Option<String> {
     if agent == "opencode" {
         return opencode_first_prompt(session_id);
@@ -75,6 +76,16 @@ fn is_wrapped_context(text: &str) -> bool {
         || text.starts_with("<user_instructions>")
         || text.starts_with("<INSTRUCTIONS>")
         || text.starts_with("# AGENTS.md")
+}
+
+/// Accept a joined prompt text when it is non-empty and not wrapped context.
+/// Shared by the Pi, Grok, and opencode parsers.
+fn genuine_prompt(text: String) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || is_wrapped_context(text) {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 /// Claude Code JSONL: the first `type=="user"` line that is not meta, carries
@@ -291,11 +302,9 @@ fn first_prompt_pi(contents: &str) -> Option<String> {
             continue;
         }
         let text = join_text_blocks(message.get("content"));
-        let text = text.trim();
-        if text.is_empty() || is_wrapped_context(text) {
-            continue;
+        if let Some(text) = genuine_prompt(text) {
+            return Some(text);
         }
-        return Some(text.to_string());
     }
     None
 }
@@ -358,8 +367,8 @@ fn join_text_blocks(content: Option<&serde_json::Value>) -> String {
 ///   { "info": {...}, "messages": [ { "info": { "role": "user", ... },
 ///     "parts": [ { "type": "text", "text": ... } ] } ] }
 /// The legacy file layout is tried first: on pre-1.18 versions it succeeds
-/// with no subprocess, and on 1.18+ the directories are absent, so the two
-/// syscalls before the export call are the only overhead.
+/// with no subprocess, and on 1.18+ a single failed directory probe precedes
+/// the export call.
 fn opencode_first_prompt(session_id: &str) -> Option<String> {
     if let Some(text) = opencode_files_first_prompt(session_id) {
         return Some(text);
@@ -367,7 +376,7 @@ fn opencode_first_prompt(session_id: &str) -> Option<String> {
     if let Some(text) = opencode_export_first_prompt(session_id) {
         return Some(text);
     }
-    crate::debug_log("cold: opencode export produced no first prompt");
+    crate::debug_log("opencode export produced no first prompt");
     None
 }
 
@@ -378,16 +387,13 @@ fn opencode_export_first_prompt(session_id: &str) -> Option<String> {
     opencode_export_first_prompt_value(&value)
 }
 
-/// Parse `opencode export` stdout into JSON. Pure JSON parses directly. A
-/// banner line can precede the object and that banner can carry its own
-/// braces, so on a failed whole-string parse the start anchor advances past
-/// each leading `{` while the end anchor stays on the last `}`. Bounded
-/// attempts keep pathological input from turning into a parse storm;
-/// anything unparseable fails safely.
+/// Parse `opencode export` stdout into JSON. A banner line can precede the
+/// object and that banner can carry its own braces, so the start anchor
+/// advances past each leading `{` while the end anchor stays on the last
+/// `}`. The first anchored slice is the whole object when no banner precedes
+/// it. Bounded attempts keep pathological input from turning into a parse
+/// storm; anything unparseable fails safely.
 fn opencode_export_value(stdout: &str) -> Option<serde_json::Value> {
-    if let Ok(value) = serde_json::from_str(stdout) {
-        return Some(value);
-    }
     let mut start = stdout.find('{')?;
     let end = stdout.rfind('}')?;
     for _ in 0..16 {
@@ -416,11 +422,9 @@ fn opencode_export_first_prompt_value(value: &serde_json::Value) -> Option<Strin
             continue;
         }
         let text = join_text_blocks(message.get("parts"));
-        let text = text.trim();
-        if text.is_empty() || is_wrapped_context(text) {
-            continue;
+        if let Some(text) = genuine_prompt(text) {
+            return Some(text);
         }
-        return Some(text.to_string());
     }
     None
 }
@@ -452,11 +456,9 @@ fn opencode_files_first_prompt(session_id: &str) -> Option<String> {
             },
         };
         let text = opencode_message_text(&root, &message_id);
-        let text = text.trim();
-        if text.is_empty() || is_wrapped_context(text) {
-            continue;
+        if let Some(text) = genuine_prompt(text) {
+            return Some(text);
         }
-        return Some(text.to_string());
     }
     None
 }
