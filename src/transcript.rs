@@ -79,7 +79,7 @@ fn is_wrapped_context(text: &str) -> bool {
 }
 
 /// Accept a joined prompt text when it is non-empty and not wrapped context.
-/// Shared by the Pi, Grok, and opencode parsers.
+/// Shared by the Pi and opencode parsers.
 fn genuine_prompt(text: String) -> Option<String> {
     let text = text.trim();
     if text.is_empty() || is_wrapped_context(text) {
@@ -370,14 +370,26 @@ fn join_text_blocks(content: Option<&serde_json::Value>) -> String {
 /// with no subprocess, and on 1.18+ a single failed directory probe precedes
 /// the export call.
 fn opencode_first_prompt(session_id: &str) -> Option<String> {
-    if let Some(text) = opencode_files_first_prompt(session_id) {
-        return Some(text);
+    let prompt = opencode_first_prompt_with(
+        session_id,
+        opencode_files_first_prompt,
+        opencode_export_first_prompt,
+    );
+    if prompt.is_none() {
+        crate::debug_log("opencode export produced no first prompt");
     }
-    if let Some(text) = opencode_export_first_prompt(session_id) {
-        return Some(text);
-    }
-    crate::debug_log("opencode export produced no first prompt");
-    None
+    prompt
+}
+
+/// The two-backend selection policy, pure so the fall-through ordering is
+/// unit-testable: a legacy-layout hit wins, a legacy miss falls through to
+/// `opencode export`, and both missing is `None` (the wrapper logs it).
+fn opencode_first_prompt_with(
+    session_id: &str,
+    files: fn(&str) -> Option<String>,
+    export: fn(&str) -> Option<String>,
+) -> Option<String> {
+    files(session_id).or_else(|| export(session_id))
 }
 
 /// Read the first prompt through `opencode export`.
@@ -893,5 +905,38 @@ mod tests {
         assert!(opencode_export_value("no json here").is_none());
         assert!(opencode_export_value("{\"messages\":[]}").is_some());
         assert!(opencode_export_value("} {").is_none());
+    }
+
+    fn files_hit(_session: &str) -> Option<String> {
+        Some("from files".to_string())
+    }
+
+    fn files_miss(_session: &str) -> Option<String> {
+        None
+    }
+
+    fn export_hit(_session: &str) -> Option<String> {
+        Some("from export".to_string())
+    }
+
+    #[test]
+    fn opencode_fall_through_files_hit_wins() {
+        assert_eq!(
+            opencode_first_prompt_with("ses_x", files_hit, export_hit).as_deref(),
+            Some("from files")
+        );
+    }
+
+    #[test]
+    fn opencode_fall_through_files_miss_uses_export() {
+        assert_eq!(
+            opencode_first_prompt_with("ses_x", files_miss, export_hit).as_deref(),
+            Some("from export")
+        );
+    }
+
+    #[test]
+    fn opencode_fall_through_both_miss_is_none() {
+        assert!(opencode_first_prompt_with("ses_x", files_miss, files_miss).is_none());
     }
 }

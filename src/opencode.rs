@@ -15,6 +15,10 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 /// cold_phase_poll_budget_stays_under_claim_ttl in main.rs, which pins the
 /// worst-case poll budget well inside the 120s claim TTL.
 pub(crate) const EXPORT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Sweeper ceiling for abandoned export temp files. Long enough that a
+/// concurrent cold phase's in-flight export is never swept, short enough that
+/// leftovers from crashed runs do not accumulate.
+const STALE_EXPORT_MAX_AGE: Duration = Duration::from_secs(86_400);
 /// Temp-file name prefix shared by the export writer and the sweeper.
 const EXPORT_FILE_PREFIX: &str = "herdr-renamer-export-";
 const DEFAULT_MODELS: &[&str] = &[
@@ -42,9 +46,8 @@ fn kill_and_reap(child: &mut Child) {
 }
 
 /// Run `opencode run` non-interactively and return its raw stdout for the
-/// caller to parse. Runs from the temp dir so opencode does not load project
-/// context, and with the herdr pane env stripped so opencode's herdr
-/// integration plugin stays inert for this throwaway call.
+/// caller to parse. Spawned through `opencode_command` for the shared
+/// subprocess hygiene.
 pub fn generate(instruction: &str, model: &str) -> Option<String> {
     let bin = resolve_bin()?;
 
@@ -81,10 +84,10 @@ pub fn generate(instruction: &str, model: &str) -> Option<String> {
 }
 
 /// `opencode export <session>` prints the whole session as JSON on stdout.
-/// Runs with the same hygiene as `generate` (temp dir, pane env stripped) so
-/// opencode's own herdr integration stays inert. Stdout goes to a temp file
-/// instead of a pipe for two reasons: exports can exceed the OS pipe buffer,
-/// and piped export output gets truncated by opencode on large sessions.
+/// Spawned through `opencode_command` for the shared subprocess hygiene.
+/// Stdout goes to a temp file instead of a pipe for two reasons: exports can
+/// exceed the OS pipe buffer, and piped export output gets truncated by
+/// opencode on large sessions.
 pub(crate) fn export_session(session_id: &str) -> Option<String> {
     sweep_stale_exports();
     let bin = resolve_bin()?;
@@ -147,6 +150,7 @@ fn sweep_stale_exports() {
         let Ok(entries) = std::fs::read_dir(env::temp_dir()) else {
             return;
         };
+        let now = std::time::SystemTime::now();
         for entry in entries.flatten() {
             let name = entry.file_name();
             if !name.to_string_lossy().starts_with(EXPORT_FILE_PREFIX) {
@@ -155,13 +159,14 @@ fn sweep_stale_exports() {
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
-            let age = match std::time::SystemTime::now()
-                .duration_since(meta.modified().unwrap_or(std::time::SystemTime::now()))
-            {
-                Ok(age) => age,
-                Err(_) => continue,
+            let Some(age) = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+            else {
+                continue;
             };
-            if age > Duration::from_secs(86_400) {
+            if age > STALE_EXPORT_MAX_AGE {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
