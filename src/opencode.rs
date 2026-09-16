@@ -86,10 +86,7 @@ pub fn generate(instruction: &str, model: &str) -> Option<String> {
 /// instead of a pipe for two reasons: exports can exceed the OS pipe buffer,
 /// and piped export output gets truncated by opencode on large sessions.
 pub(crate) fn export_session(session_id: &str) -> Option<String> {
-    // Housekeeping runs once per process: each cold phase is its own process,
-    // so repeating the temp-dir scan on every poll attempt would only add I/O.
-    static SWEEP: Once = Once::new();
-    SWEEP.call_once(sweep_stale_exports);
+    sweep_stale_exports();
     let bin = resolve_bin()?;
     let temp = env::temp_dir().join(format!(
         "{}{}-{}",
@@ -140,30 +137,35 @@ pub(crate) fn export_session(session_id: &str) -> Option<String> {
 }
 
 /// Best-effort cleanup of export temp files left behind when a detached cold
-/// phase was killed between file creation and removal. Runs once per process.
-/// Files older than a day are removed; any error is ignored.
+/// phase was killed between file creation and removal. Runs once per process
+/// (each cold phase is its own process, so repeating the temp-dir scan on
+/// every poll attempt would only add I/O). Files older than a day are
+/// removed; any error is ignored.
 fn sweep_stale_exports() {
-    let Ok(entries) = std::fs::read_dir(env::temp_dir()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with(EXPORT_FILE_PREFIX) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else {
-            continue;
+    static SWEEP: Once = Once::new();
+    SWEEP.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(env::temp_dir()) else {
+            return;
         };
-        let age = match std::time::SystemTime::now()
-            .duration_since(meta.modified().unwrap_or(std::time::SystemTime::now()))
-        {
-            Ok(age) => age,
-            Err(_) => continue,
-        };
-        if age > Duration::from_secs(86_400) {
-            let _ = std::fs::remove_file(entry.path());
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with(EXPORT_FILE_PREFIX) {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let age = match std::time::SystemTime::now()
+                .duration_since(meta.modified().unwrap_or(std::time::SystemTime::now()))
+            {
+                Ok(age) => age,
+                Err(_) => continue,
+            };
+            if age > Duration::from_secs(86_400) {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
-    }
+    });
 }
 
 /// Models resolve from plural env/config, then the legacy singular knob. The

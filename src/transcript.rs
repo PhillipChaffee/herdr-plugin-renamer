@@ -387,26 +387,46 @@ fn opencode_export_first_prompt(session_id: &str) -> Option<String> {
     opencode_export_first_prompt_value(&value)
 }
 
-/// Parse `opencode export` stdout into JSON. A banner line can precede the
-/// object and that banner can carry its own braces, so the start anchor
-/// advances past each leading `{` while the end anchor stays on the last
-/// `}`. The first anchored slice is the whole object when no banner precedes
-/// it. Bounded attempts keep pathological input from turning into a parse
-/// storm; anything unparseable fails safely.
+/// Parse `opencode export` stdout into JSON. A banner can precede the object
+/// and a footer can follow it, and either can carry its own braces, so on a
+/// failed whole-string parse the anchors walk inward: up to nine `{` starts
+/// crossed with up to nine `}` ends, largest span first. Largest first is
+/// what makes the walk pick the session object over a brace-bearing noise
+/// line, and the fixed candidate count keeps pathological input from
+/// turning into a parse storm. Anything unparseable fails safely.
 fn opencode_export_value(stdout: &str) -> Option<serde_json::Value> {
-    let mut start = stdout.find('{')?;
-    let end = stdout.rfind('}')?;
-    for _ in 0..16 {
-        if end < start {
-            return None;
-        }
+    if let Ok(value) = serde_json::from_str(stdout) {
+        return Some(value);
+    }
+    let starts: Vec<usize> = stdout
+        .match_indices('{')
+        .take(NOISE_ANCHORS)
+        .map(|(i, _)| i)
+        .collect();
+    let ends: Vec<usize> = stdout
+        .rmatch_indices('}')
+        .take(NOISE_ANCHORS)
+        .map(|(i, _)| i)
+        .collect();
+    let mut spans: Vec<(usize, usize)> = starts
+        .iter()
+        .flat_map(|&start| {
+            ends.iter()
+                .filter(move |&&end| end >= start)
+                .map(move |&end| (start, end))
+        })
+        .collect();
+    spans.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
+    for (start, end) in spans {
         if let Ok(value) = serde_json::from_str(&stdout[start..=end]) {
             return Some(value);
         }
-        start += 1 + stdout[start + 1..].find('{')?;
     }
     None
 }
+
+/// How many brace anchors on each side the noise-tolerant parse walks.
+const NOISE_ANCHORS: usize = 9;
 
 /// Extract the first genuine user prompt from an `opencode export` JSON value.
 /// Pure so it is unit-testable; the caller handles the subprocess.
@@ -847,9 +867,20 @@ mod tests {
             Some("hello")
         );
         // Banner noise that itself contains braces must not defeat the
-        // start-anchor walk.
+        // span walk.
         let braced_banner = "config: {\"theme\":\"dark\"} loaded\n";
         let value = opencode_export_value(&format!("{braced_banner}{json}")).unwrap();
+        assert_eq!(
+            opencode_export_first_prompt_value(&value).as_deref(),
+            Some("hello")
+        );
+        // The same holds for footer noise with braces, and for both sides.
+        let value = opencode_export_value(&format!("{json}\nstate {{ok}}")).unwrap();
+        assert_eq!(
+            opencode_export_first_prompt_value(&value).as_deref(),
+            Some("hello")
+        );
+        let value = opencode_export_value(&format!("{braced_banner}{json}\nstate {{ok}}")).unwrap();
         assert_eq!(
             opencode_export_first_prompt_value(&value).as_deref(),
             Some("hello")
