@@ -1,5 +1,6 @@
-//! Naming engine backed by headless `opencode run` calls. The caller walks the
-//! configured free-model list and then falls through to the next engine.
+//! Naming engine and transcript export backed by headless `opencode` calls.
+//! Naming walks the configured free-model list and falls through to the next
+//! engine. Transcript export serves the first-prompt reader in transcript.rs.
 
 use std::env;
 use std::io::Read;
@@ -8,6 +9,11 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
+/// A real 745KB export completes in about a second, so the ceiling only
+/// bounds a hung export. It is short on purpose: the prompt poll calls this
+/// up to 20 times per cold phase, and a per-attempt ceiling of 5s keeps that
+/// poll inside the 120s claim TTL.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MODELS: &[&str] = &[
     "opencode/deepseek-v4-flash-free",
     "opencode/ling-3.0-flash-free",
@@ -60,8 +66,10 @@ pub fn generate(instruction: &str, model: &str) -> Option<String> {
 /// `opencode export <session>` prints the whole session as JSON on stdout.
 /// Runs with the same hygiene as `generate` (temp dir, pane env stripped) so
 /// opencode's own herdr integration stays inert. Stdout goes to a temp file
-/// instead of a pipe because exports can exceed the OS pipe buffer.
-pub(crate) fn export_session(session_id: &str, timeout: Duration) -> Option<String> {
+/// instead of a pipe for two reasons: exports can exceed the OS pipe buffer,
+/// and piped export output gets truncated by opencode on large sessions.
+pub(crate) fn export_session(session_id: &str) -> Option<String> {
+    sweep_stale_exports();
     let bin = resolve_bin()?;
     let temp = env::temp_dir().join(format!(
         "herdr-renamer-export-{}-{}",
@@ -96,7 +104,7 @@ pub(crate) fn export_session(session_id: &str, timeout: Duration) -> Option<Stri
             return None;
         }
     };
-    let status = match wait_with_timeout(&mut child, timeout) {
+    let status = match wait_with_timeout(&mut child, EXPORT_TIMEOUT) {
         Some(status) => status,
         None => {
             let _ = child.kill();
@@ -111,6 +119,33 @@ pub(crate) fn export_session(session_id: &str, timeout: Duration) -> Option<Stri
         None
     } else {
         Some(stdout)
+    }
+}
+
+/// Best-effort cleanup of export temp files left behind when a detached cold
+/// phase was killed between file creation and removal. Files older than a day
+/// are removed; any error is ignored.
+fn sweep_stale_exports() {
+    let Ok(entries) = std::fs::read_dir(env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("herdr-renamer-export-") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let age = match std::time::SystemTime::now()
+            .duration_since(meta.modified().unwrap_or(std::time::SystemTime::now()))
+        {
+            Ok(age) => age,
+            Err(_) => continue,
+        };
+        if age > Duration::from_secs(86_400) {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -193,7 +228,7 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus>
 
 #[cfg(test)]
 mod tests {
-    use super::parse_model_list;
+    use super::{export_session, parse_model_list};
 
     #[test]
     fn model_list_accepts_commas_and_lines() {
@@ -201,5 +236,15 @@ mod tests {
             parse_model_list("a/one, b/two\nc/three\n"),
             vec!["a/one", "b/two", "c/three"]
         );
+    }
+
+    /// Live fail-open contract for the export subprocess. Run with:
+    /// cargo test export -- --ignored
+    /// Needs the opencode CLI installed; without it the spawn fails and the
+    /// None contract holds trivially.
+    #[test]
+    #[ignore]
+    fn export_session_fails_open_on_missing_session() {
+        assert!(export_session("ses_does_not_exist_0000000000").is_none());
     }
 }

@@ -4,13 +4,12 @@
 
 use std::env;
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// Resolve the transcript file, read it, and return the first real user prompt.
 /// Some integrations (pi) report the transcript's absolute path as the session
 /// value, so an existing-file path short-circuits the per-agent glob. opencode
-/// stores one JSON file per message rather than a single transcript file, so
-/// it takes a directory-walking path instead of the shared file read.
+/// reads through the legacy file layout first and falls through to
+/// `opencode export` when the files are absent.
 pub fn read_first_prompt(agent: &str, session_id: &str) -> Option<String> {
     if agent == "opencode" {
         return opencode_first_prompt(session_id);
@@ -339,7 +338,7 @@ fn first_prompt_grok(contents: &str) -> Option<String> {
 }
 
 /// Join the `text` fields of `[{type:"text",text:...}]` content blocks. Shared
-/// by the Pi and Grok parsers, whose block shape matches.
+/// by the Pi, Grok, and opencode parsers, whose block shape matches.
 fn join_text_blocks(content: Option<&serde_json::Value>) -> String {
     content
         .and_then(|c| c.as_array())
@@ -358,36 +357,49 @@ fn join_text_blocks(content: Option<&serde_json::Value>) -> String {
 /// chronological order:
 ///   { "info": {...}, "messages": [ { "info": { "role": "user", ... },
 ///     "parts": [ { "type": "text", "text": ... } ] } ] }
-/// Older versions store one JSON file per message, so the file layout stays
-/// as a fallback for when the export call fails.
+/// The legacy file layout is tried first: on pre-1.18 versions it succeeds
+/// with no subprocess, and on 1.18+ the directories are absent, so the two
+/// syscalls before the export call are the only overhead.
 fn opencode_first_prompt(session_id: &str) -> Option<String> {
+    if let Some(text) = opencode_files_first_prompt(session_id) {
+        return Some(text);
+    }
     if let Some(text) = opencode_export_first_prompt(session_id) {
         return Some(text);
     }
-    opencode_files_first_prompt(session_id)
+    crate::debug_log("cold: opencode export produced no first prompt");
+    None
 }
-
-/// How long to wait on `opencode export` before falling back to the file
-/// layout. Matches the repo's per-model naming ceiling.
-const OPENCODE_EXPORT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Read the first prompt through `opencode export`.
 fn opencode_export_first_prompt(session_id: &str) -> Option<String> {
-    let stdout = crate::opencode::export_session(session_id, OPENCODE_EXPORT_TIMEOUT)?;
+    let stdout = crate::opencode::export_session(session_id)?;
     let value = opencode_export_value(&stdout)?;
     opencode_export_first_prompt_value(&value)
 }
 
-/// Parse `opencode export` stdout into JSON. A banner line can precede the
-/// object and a footer could follow it, so the parse spans the first `{` to
-/// the last `}` and fails safely to the legacy file fallback otherwise.
+/// Parse `opencode export` stdout into JSON. Pure JSON parses directly. A
+/// banner line can precede the object and that banner can carry its own
+/// braces, so on a failed whole-string parse the start anchor advances past
+/// each leading `{` while the end anchor stays on the last `}`. Bounded
+/// attempts keep pathological input from turning into a parse storm;
+/// anything unparseable fails safely.
 fn opencode_export_value(stdout: &str) -> Option<serde_json::Value> {
-    let start = stdout.find('{')?;
-    let end = stdout.rfind('}')?;
-    if end < start {
-        return None;
+    if let Ok(value) = serde_json::from_str(stdout) {
+        return Some(value);
     }
-    serde_json::from_str(&stdout[start..=end]).ok()
+    let mut start = stdout.find('{')?;
+    let end = stdout.rfind('}')?;
+    for _ in 0..16 {
+        if end < start {
+            return None;
+        }
+        if let Ok(value) = serde_json::from_str(&stdout[start..=end]) {
+            return Some(value);
+        }
+        start += 1 + stdout[start + 1..].find('{')?;
+    }
+    None
 }
 
 /// Extract the first genuine user prompt from an `opencode export` JSON value.
@@ -403,18 +415,7 @@ fn opencode_export_first_prompt_value(value: &serde_json::Value) -> Option<Strin
         {
             continue;
         }
-        let text = message
-            .get("parts")
-            .and_then(|p| p.as_array())
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
+        let text = join_text_blocks(message.get("parts"));
         let text = text.trim();
         if text.is_empty() || is_wrapped_context(text) {
             continue;
@@ -829,22 +830,24 @@ mod tests {
     }
 
     #[test]
-    fn opencode_export_value_strips_banner() {
-        let banner = "Exporting session: ses_x\n";
+    fn opencode_export_value_strips_surrounding_noise() {
         let json =
             r#"{"messages":[{"info":{"role":"user"},"parts":[{"type":"text","text":"hello"}]}]}"#;
+        let banner = "Exporting session: ses_x\n";
         let value = opencode_export_value(&format!("{banner}{json}")).unwrap();
         assert_eq!(
             opencode_export_first_prompt_value(&value).as_deref(),
             Some("hello")
         );
-    }
-
-    #[test]
-    fn opencode_export_value_tolerates_trailing_noise() {
-        let json =
-            r#"{"messages":[{"info":{"role":"user"},"parts":[{"type":"text","text":"hello"}]}]}"#;
         let value = opencode_export_value(&format!("{json}\nDone.")).unwrap();
+        assert_eq!(
+            opencode_export_first_prompt_value(&value).as_deref(),
+            Some("hello")
+        );
+        // Banner noise that itself contains braces must not defeat the
+        // start-anchor walk.
+        let braced_banner = "config: {\"theme\":\"dark\"} loaded\n";
+        let value = opencode_export_value(&format!("{braced_banner}{json}")).unwrap();
         assert_eq!(
             opencode_export_first_prompt_value(&value).as_deref(),
             Some("hello")

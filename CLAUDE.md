@@ -203,9 +203,10 @@ This fork diverges from the upstream doc above in these ways:
 
 - Agents: transcript parsers also cover `pi` (JSONL), `grok`
   (`chat_history.jsonl`, prompt inside `<user_query>` tags), and `opencode`
-  (read through `opencode export`, which covers the SQLite-backed storage of
-  opencode 1.18+; the legacy file layout `storage/message/<ses>/msg_*.json` +
-  `storage/part/<msg>/prt_*.json` remains as a fallback when export fails).
+  (legacy file layout `storage/message/<ses>/msg_*.json` +
+  `storage/part/<msg>/prt_*.json` is probed first; opencode 1.18+ keeps
+  sessions in SQLite, so when the files are absent the parser reads through
+  `opencode export`, which is backend-agnostic).
   Path-form session values (pi reports the transcript path) are used directly.
   Grok has no integration: `grok.rs` resolves the session from
   `~/.grok/active_sessions.json` by pane foreground pid, else cwd+newest-live.
