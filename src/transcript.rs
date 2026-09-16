@@ -4,6 +4,7 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Resolve the transcript file, read it, and return the first real user prompt.
 /// Some integrations (pi) report the transcript's absolute path as the session
@@ -352,10 +353,82 @@ fn join_text_blocks(content: Option<&serde_json::Value>) -> String {
         .unwrap_or_default()
 }
 
-/// opencode splits a session across `storage/message/<session_id>/msg_*.json`
-/// (role metadata) and `storage/part/<message_id>/prt_*.json` (content blocks).
-/// Message and part ids are time-ordered, so a filename sort is chronological.
+/// opencode 1.18+ keeps sessions in a SQLite database instead of files on
+/// disk, and `opencode export <session>` prints the whole session in
+/// chronological order:
+///   { "info": {...}, "messages": [ { "info": { "role": "user", ... },
+///     "parts": [ { "type": "text", "text": ... } ] } ] }
+/// Older versions store one JSON file per message, so the file layout stays
+/// as a fallback for when the export call fails.
 fn opencode_first_prompt(session_id: &str) -> Option<String> {
+    if let Some(text) = opencode_export_first_prompt(session_id) {
+        return Some(text);
+    }
+    opencode_files_first_prompt(session_id)
+}
+
+/// How long to wait on `opencode export` before falling back to the file
+/// layout. Matches the repo's per-model naming ceiling.
+const OPENCODE_EXPORT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Read the first prompt through `opencode export`.
+fn opencode_export_first_prompt(session_id: &str) -> Option<String> {
+    let stdout = crate::opencode::export_session(session_id, OPENCODE_EXPORT_TIMEOUT)?;
+    let value = opencode_export_value(&stdout)?;
+    opencode_export_first_prompt_value(&value)
+}
+
+/// Parse `opencode export` stdout into JSON. A banner line can precede the
+/// object and a footer could follow it, so the parse spans the first `{` to
+/// the last `}` and fails safely to the legacy file fallback otherwise.
+fn opencode_export_value(stdout: &str) -> Option<serde_json::Value> {
+    let start = stdout.find('{')?;
+    let end = stdout.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    serde_json::from_str(&stdout[start..=end]).ok()
+}
+
+/// Extract the first genuine user prompt from an `opencode export` JSON value.
+/// Pure so it is unit-testable; the caller handles the subprocess.
+fn opencode_export_first_prompt_value(value: &serde_json::Value) -> Option<String> {
+    let messages = value.get("messages")?.as_array()?;
+    for message in messages {
+        if message
+            .get("info")
+            .and_then(|i| i.get("role"))
+            .and_then(|r| r.as_str())
+            != Some("user")
+        {
+            continue;
+        }
+        let text = message
+            .get("parts")
+            .and_then(|p| p.as_array())
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let text = text.trim();
+        if text.is_empty() || is_wrapped_context(text) {
+            continue;
+        }
+        return Some(text.to_string());
+    }
+    None
+}
+
+/// Legacy opencode layout: a session is split across
+/// `storage/message/<session_id>/msg_*.json` (role metadata) and
+/// `storage/part/<message_id>/prt_*.json` (content blocks).
+/// Message and part ids are time-ordered, so a filename sort is chronological.
+fn opencode_files_first_prompt(session_id: &str) -> Option<String> {
     let root = opencode_storage_root()?;
     let msg_dir = root.join("message").join(session_id);
     for msg_path in sorted_json_files(&msg_dir) {
@@ -709,5 +782,80 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
 
         assert_eq!(prompt.as_deref(), Some("帮我看下"));
+    }
+
+    #[test]
+    fn opencode_export_skips_wrapped_context() {
+        let json = concat!(
+            r#"{"info":{},"messages":["#,
+            r#"{"info":{"role":"user"},"parts":[{"type":"text","text":"<user_info>env</user_info>"}]},"#,
+            r#"{"info":{"role":"user"},"parts":[{"type":"text","text":"Add OAuth login to the dashboard"}]}"#,
+            r#"]}"#,
+        );
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            opencode_export_first_prompt_value(&value).as_deref(),
+            Some("Add OAuth login to the dashboard")
+        );
+    }
+
+    #[test]
+    fn opencode_export_joins_text_parts() {
+        let json = concat!(
+            r#"{"messages":[{"info":{"role":"user"},"parts":["#,
+            r#"{"type":"text","text":"First line"},"#,
+            r#"{"type":"file","text":"skip me"},"#,
+            r#"{"type":"text","text":"second half"}"#,
+            r#"]}]}"#,
+        );
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            opencode_export_first_prompt_value(&value).as_deref(),
+            Some("First line\nsecond half")
+        );
+    }
+
+    #[test]
+    fn opencode_export_no_user_prompt_returns_none() {
+        let json = concat!(
+            r#"{"messages":["#,
+            r#"{"info":{"role":"assistant"},"parts":[{"type":"text","text":"hi"}]},"#,
+            r#"{"info":{"role":"user"},"parts":[{"type":"text","text":"  "}]},"#,
+            r#"{"info":{"role":"user"},"parts":[{"type":"text","text":"<system-reminder>x</system-reminder>"}]}"#,
+            r#"]}"#,
+        );
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(opencode_export_first_prompt_value(&value).is_none());
+    }
+
+    #[test]
+    fn opencode_export_value_strips_banner() {
+        let banner = "Exporting session: ses_x\n";
+        let json =
+            r#"{"messages":[{"info":{"role":"user"},"parts":[{"type":"text","text":"hello"}]}]}"#;
+        let value = opencode_export_value(&format!("{banner}{json}")).unwrap();
+        assert_eq!(
+            opencode_export_first_prompt_value(&value).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn opencode_export_value_tolerates_trailing_noise() {
+        let json =
+            r#"{"messages":[{"info":{"role":"user"},"parts":[{"type":"text","text":"hello"}]}]}"#;
+        let value = opencode_export_value(&format!("{json}\nDone.")).unwrap();
+        assert_eq!(
+            opencode_export_first_prompt_value(&value).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn opencode_export_value_rejects_garbage() {
+        assert!(opencode_export_value("").is_none());
+        assert!(opencode_export_value("no json here").is_none());
+        assert!(opencode_export_value("{\"messages\":[]}").is_some());
+        assert!(opencode_export_value("} {").is_none());
     }
 }

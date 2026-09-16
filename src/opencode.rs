@@ -3,6 +3,7 @@
 
 use std::env;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,63 @@ pub fn generate(instruction: &str, model: &str) -> Option<String> {
         None
     } else {
         Some(raw)
+    }
+}
+
+/// `opencode export <session>` prints the whole session as JSON on stdout.
+/// Runs with the same hygiene as `generate` (temp dir, pane env stripped) so
+/// opencode's own herdr integration stays inert. Stdout goes to a temp file
+/// instead of a pipe because exports can exceed the OS pipe buffer.
+pub(crate) fn export_session(session_id: &str, timeout: Duration) -> Option<String> {
+    let bin = resolve_bin()?;
+    let temp = env::temp_dir().join(format!(
+        "herdr-renamer-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    // O_EXCL and owner-only perms: the file holds the user's session transcript.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .ok()?;
+
+    let mut command = Command::new(bin);
+    command
+        .arg("export")
+        .arg(session_id)
+        .current_dir(env::temp_dir())
+        .env_remove("HERDR_PANE_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::null());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = std::fs::remove_file(&temp);
+            return None;
+        }
+    };
+    let status = match wait_with_timeout(&mut child, timeout) {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&temp);
+            return None;
+        }
+    };
+    let stdout = std::fs::read_to_string(&temp).unwrap_or_default();
+    let _ = std::fs::remove_file(&temp);
+    if !status.success() || stdout.trim().is_empty() {
+        None
+    } else {
+        Some(stdout)
     }
 }
 
